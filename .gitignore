@@ -1,0 +1,33 @@
+# Build artifacts
+bin/
+/nexthop
+/mockupstream
+*.exe
+*.out
+*.test
+
+# Coverage and profiling output
+coverage.out
+coverage.html
+*.prof
+
+# Runtime and temporary files
+*.tmp
+*.log
+*.pid
+*.sock
+
+# Local configuration and environment files
+.env
+.env.*
+!.env.example
+config.local.yaml
+config.local.yml
+
+# Local agent/editor state
+.codewhale/
+.mimocode/
+
+# Private deployment helpers (contain environment-specific hosts/paths)
+/deploy_test.sh
+/tests/integration/run.sh

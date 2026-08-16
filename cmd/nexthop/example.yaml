@@ -1,0 +1,41 @@
+# nexthop 网关服务配置示例
+# 由 `nexthop install` 写入 /etc/nexthop/config.yaml（已存在则不覆盖）
+
+# 每轮探测的间隔（支持 1ms / 1s / 1m 等 Go duration 写法）
+probe_interval: 5s
+
+# 单次探测的超时时间，必须小于 probe_interval
+probe_timeout: 1s
+
+# 出口网卡：default route 绑定的 dev（网关机器上连上游的那个网卡）
+egress_device: eth0
+
+# 防抖：目标状态需连续 N 轮探测保持才翻转（防止抖动导致路由 flapping）
+stable_rounds: 2
+
+# 全部上游失效时的兜底下一跳
+final_ip: 10.0.0.254
+
+# 候选上游列表（按权重降序选择存活者作为实际 default route 上游）
+targets:
+  - name: aliyun
+    ip: 10.0.0.1
+    weight: 100
+    probe: ping          # ping 只需要 ip
+
+  - name: tencent
+    ip: 10.0.0.2
+    weight: 80
+    probe: tcp            # tcp / udp 需要 ip + port
+    port: 443
+
+  - name: dns_upstream
+    ip: 1.1.1.1
+    weight: 90
+    probe: udp
+    port: 53
+
+  - name: corporate
+    url: http://192.168.1.1/healthz   # http 需要完整 URL（跳过 TLS 证书校验）
+    weight: 70
+    probe: http
