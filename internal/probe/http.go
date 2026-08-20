@@ -6,23 +6,18 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"sync/atomic"
 	"time"
 )
 
 // httpProber 通过 HTTP 探测上游可用性。
 //
 // 连接策略：启用 keep-alive 连接池（net/http 自带池化，每个 target 一个
-// Client/Transport），避免高频探测的连接风暴；同时通过 rebuildEvery
-// 周期性强制清空连接池，定期验证"现在能否新建连接"，防止池化掩盖服务故障。
+// Client/Transport），避免高频探测的连接风暴。连接异常时由 net/http
+// 自动丢弃失效连接，并在后续请求中重新建立连接。
 type httpProber struct {
-	url      string
-	timeout  time.Duration
-	client   *http.Client
-	transport *http.Transport
-
-	probeCount  atomic.Uint64
-	rebuildEvery uint64 // 每 N 次探测强制重建连接（0 = 禁用）
+	url     string
+	timeout time.Duration
+	client  *http.Client
 }
 
 func newHTTPProber(url string, timeout time.Duration) (Prober, error) {
@@ -30,7 +25,7 @@ func newHTTPProber(url string, timeout time.Duration) (Prober, error) {
 	transport := &http.Transport{
 		DialContext: (&net.Dialer{Timeout: timeout}).DialContext,
 		// keep-alive 连接池：减少连接建立频率（局域网探测每次复用同一连接）。
-		MaxIdleConns:       2,
+		MaxIdleConns:        2,
 		MaxIdleConnsPerHost: 1,
 		IdleConnTimeout:     30 * time.Second,
 		TLSClientConfig: &tls.Config{
@@ -38,21 +33,14 @@ func newHTTPProber(url string, timeout time.Duration) (Prober, error) {
 		},
 	}
 	return &httpProber{
-		url:          url,
-		timeout:      timeout,
-		client:       &http.Client{Timeout: timeout, Transport: transport},
-		transport:    transport,
-		rebuildEvery: 10, // 每 10 次探测（如 200ms 间隔 ≈ 2s）强制新连接验证一次
+		url:     url,
+		timeout: timeout,
+		client:  &http.Client{Timeout: timeout, Transport: transport},
 	}, nil
 }
 
 // Probe 以 HTTP 状态码 < 400 判定可达。
 func (p *httpProber) Probe(ctx context.Context) Result {
-	// 周期性强制重建连接：防止 keep-alive 复用掩盖"服务已停止接受新连接"。
-	if p.rebuildEvery > 0 && p.probeCount.Add(1)%p.rebuildEvery == 0 {
-		p.transport.CloseIdleConnections()
-	}
-
 	start := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.url, nil)
 	if err != nil {

@@ -14,8 +14,8 @@ import (
 // 服务端 Accept 调用数含阻塞等待，不能作为连接数判据）。
 type dialCounter struct{ n atomic.Int64 }
 
-func (d *dialCounter) inc()        { d.n.Add(1) }
-func (d *dialCounter) count() int  { return int(d.n.Load()) }
+func (d *dialCounter) inc()       { d.n.Add(1) }
+func (d *dialCounter) count() int { return int(d.n.Load()) }
 
 // newPooledHTTPProber 构造带 Dial 计数的 httpProber（复用正式参数）。
 func newPooledHTTPProber(t *testing.T, url string) (*httpProber, *dialCounter) {
@@ -26,17 +26,15 @@ func newPooledHTTPProber(t *testing.T, url string) (*httpProber, *dialCounter) {
 			dials.inc()
 			return (&net.Dialer{Timeout: 500 * time.Millisecond}).DialContext(ctx, network, addr)
 		},
-		MaxIdleConns:       2,
+		MaxIdleConns:        2,
 		MaxIdleConnsPerHost: 1,
 		IdleConnTimeout:     30 * time.Second,
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
 	}
 	p := &httpProber{
-		url:          url,
-		timeout:      500 * time.Millisecond,
-		client:       &http.Client{Timeout: 500 * time.Millisecond, Transport: transport},
-		transport:    transport,
-		rebuildEvery: 10,
+		url:     url,
+		timeout: 500 * time.Millisecond,
+		client:  &http.Client{Timeout: 500 * time.Millisecond, Transport: transport},
 	}
 	return p, dials
 }
@@ -61,7 +59,7 @@ func TestHTTPProbeReusesConnection(t *testing.T) {
 	defer srv.Close()
 
 	p, dials := newPooledHTTPProber(t, url)
-	for i := 0; i < 5; i++ { // 少于 rebuildEvery(10)
+	for i := 0; i < 5; i++ {
 		res := p.Probe(context.Background())
 		if !res.OK {
 			t.Fatalf("第 %d 次探测失败: %v", i, res.Error)
@@ -69,24 +67,6 @@ func TestHTTPProbeReusesConnection(t *testing.T) {
 	}
 	if got := dials.count(); got != 1 {
 		t.Fatalf("连接复用失效：客户端建立了 %d 条连接，期望 1", got)
-	}
-}
-
-// 超过 rebuildEvery 次后应周期性重建连接（定期验证新建连接能力）。
-func TestHTTPProbeRebuildsConnection(t *testing.T) {
-	srv, url := newPoolTestServer(t)
-	defer srv.Close()
-
-	p, dials := newPooledHTTPProber(t, url)
-	total := int(p.rebuildEvery) + 5
-	for i := 0; i < total; i++ {
-		res := p.Probe(context.Background())
-		if !res.OK {
-			t.Fatalf("第 %d 次探测失败: %v", i, res.Error)
-		}
-	}
-	if got := dials.count(); got < 2 {
-		t.Fatalf("周期性重建未生效：客户端仅建立了 %d 条连接，期望 >= 2", got)
 	}
 }
 
