@@ -38,8 +38,25 @@ type menuItem struct {
 
 var menuItems = []menuItem{
 	{"实时状态 + 配置列表（自动刷新，q/ESC 退出）", func(m *mainMenu) { m.runSub(func() error { return watchStatus(m.c, 100*time.Millisecond) }) }},
-	{"编辑配置（全局 + 上游）", func(m *mainMenu) { m.runSub(func() error { e, err := newCfgEditor(m.c); if err != nil { return err }; return e.run() }) }},
-	{"新增上游", func(m *mainMenu) { m.runSub(func() error { w, err := newAddWizard(m.c); if err != nil { return err }; return w.run() }) }},
+	{"编辑配置（全局 + 上游）", func(m *mainMenu) {
+		m.runSub(func() error {
+			e, err := newCfgEditor(m.c)
+			if err != nil {
+				return err
+			}
+			return e.run()
+		})
+	}},
+	{"新增上游", func(m *mainMenu) {
+		m.runSub(func() error {
+			e, err := newCfgEditor(m.c)
+			if err != nil {
+				return err
+			}
+			e.addTarget()
+			return e.run()
+		})
+	}},
 	{"热加载配置", func(m *mainMenu) { m.doAndWait("热加载", func() error { return m.c.Reload() }) }},
 	{"启动服务", func(m *mainMenu) { m.serviceAction("启动", "start") }},
 	{"停止服务", func(m *mainMenu) { m.serviceAction("停止", "stop") }},

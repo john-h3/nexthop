@@ -152,6 +152,7 @@ type editMode int
 const (
 	modeNav editMode = iota
 	modeInput
+	modeForm
 )
 
 // inputTask 是行内编辑任务（编辑 target / 新增 target 的字段序列）。
@@ -160,6 +161,14 @@ type inputTask struct {
 	cur   string
 	apply func(string) error
 	skip  func() bool // 为 true 时跳过此任务（如探测方式不匹配的端口/URL）
+}
+
+// targetFormField 是上游实例表单中的一个字段。和全局配置字段一样，
+// 字段只在按回车时进入输入状态，字段之间可以用上下键切换。
+type targetFormField struct {
+	label string
+	get   func(*config.Target) string
+	apply func(*config.Target, string) error
 }
 
 type cfgEditor struct {
@@ -174,11 +183,20 @@ type cfgEditor struct {
 	inputCur    string // 空输入时的保留值
 	inputBuf    []byte
 	inputApply  func(string) error
+	inputReturn editMode // 输入完成后返回的模式（普通导航或上游表单）
 
 	// 字段序列状态（target 编辑/新增）
 	taskQueue []inputTask
 	taskIdx   int
 	confirm   *func() // 待确认动作（y 执行）
+
+	// 上游实例表单状态。表单使用副本编辑，按 s 后才写回配置；按 q/ESC
+	// 则丢弃本次修改。
+	formActive    bool
+	formTarget    config.Target
+	formIdx       int
+	formTargetIdx int // 编辑时为配置中的下标，新增时为 -1
+	formOrigName  string
 
 	msg  string
 	quit bool
@@ -262,6 +280,10 @@ func (e *cfgEditor) handle(ev keyEvent) {
 		e.handleInput(ev)
 		return
 	}
+	if e.mode == modeForm {
+		e.handleForm(ev)
+		return
+	}
 	switch ev.act {
 	case actUp:
 		if e.sel > 0 {
@@ -286,6 +308,44 @@ func (e *cfgEditor) handle(ev keyEvent) {
 		}
 	case actEsc:
 		e.quit = true
+	}
+}
+
+func (e *cfgEditor) handleForm(ev keyEvent) {
+	fields := targetFormFields(e)
+	if len(fields) == 0 {
+		return
+	}
+	switch ev.act {
+	case actUp:
+		if e.formIdx > 0 {
+			e.formIdx--
+		}
+	case actDown:
+		if e.formIdx < len(fields)-1 {
+			e.formIdx++
+		}
+	case actEnter:
+		f := fields[e.formIdx]
+		e.startFormInput("编辑 "+f.label, f.get(&e.formTarget), func(s string) error {
+			if err := f.apply(&e.formTarget, s); err != nil {
+				return err
+			}
+			// 探测方式变化会改变表单中的端口/URL字段。
+			if e.formIdx >= len(targetFormFields(e))-1 {
+				e.formIdx = len(targetFormFields(e)) - 1
+			}
+			return nil
+		})
+	case actChar:
+		switch ev.ch {
+		case 's':
+			e.commitTargetForm()
+		case 'q':
+			e.cancelTargetForm()
+		}
+	case actEsc:
+		e.cancelTargetForm()
 	}
 }
 
@@ -318,11 +378,13 @@ func (e *cfgEditor) handleInput(ev keyEvent) {
 			e.inputBuf = nil // 清空重输
 			return
 		}
-		e.mode = modeNav
-		e.nextTask()
+		e.mode = e.inputReturn
+		if e.inputReturn == modeNav {
+			e.nextTask()
+		}
 	case actEsc:
 		e.confirm = nil
-		e.mode = modeNav
+		e.mode = e.inputReturn
 		e.msg = "已取消"
 	}
 }
@@ -350,6 +412,17 @@ func (e *cfgEditor) startInput(label, cur string, apply func(string) error) {
 	e.inputCur = cur
 	e.inputBuf = nil
 	e.inputApply = apply
+	e.inputReturn = modeNav
+	e.confirm = nil
+}
+
+func (e *cfgEditor) startFormInput(label, cur string, apply func(string) error) {
+	e.mode = modeInput
+	e.inputPrompt = label + " [" + cur + "]: "
+	e.inputCur = cur
+	e.inputBuf = nil
+	e.inputApply = apply
+	e.inputReturn = modeForm
 	e.confirm = nil
 }
 
@@ -471,59 +544,178 @@ func targetTasks(t *config.Target, editing bool) []inputTask {
 	return tasks
 }
 
-func (e *cfgEditor) editTarget(idx int) {
-	t := &e.cfg.Targets[idx]
-	// 名字查重（排除自身）
-	origName := t.Name
-	e.taskQueue = targetTasks(t, true)
-	// 名字任务加查重
-	e.taskQueue[0].apply = func(s string) error {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			return fmt.Errorf("名字不能为空")
-		}
-		for _, x := range e.cfg.Targets {
-			if x.Name == s && x.Name != origName {
-				return fmt.Errorf("名字 %q 已存在", s)
-			}
-		}
-		t.Name = s
-		return nil
+// targetFormFields 返回当前上游实例的表单字段。端口和 URL 根据探测方式动态显示，
+// 因此修改 probe 后，表单会立即切换到对应的专用字段。
+func targetFormFields(e *cfgEditor) []targetFormField {
+	fields := []targetFormField{
+		{
+			label: "名字",
+			get:   func(t *config.Target) string { return t.Name },
+			apply: func(t *config.Target, s string) error {
+				s = strings.TrimSpace(s)
+				if s == "" {
+					return fmt.Errorf("名字不能为空")
+				}
+				for i, x := range e.cfg.Targets {
+					if i != e.formTargetIdx && x.Name == s {
+						return fmt.Errorf("名字 %q 已存在", s)
+					}
+				}
+				t.Name = s
+				return nil
+			},
+		},
+		{
+			label: "IP 地址",
+			get:   func(t *config.Target) string { return t.IP },
+			apply: func(t *config.Target, s string) error {
+				s = strings.TrimSpace(s)
+				if err := validateIPv4(s); err != nil {
+					return err
+				}
+				t.IP = s
+				return nil
+			},
+		},
+		{
+			label: "权重",
+			get:   func(t *config.Target) string { return strconv.Itoa(t.Weight) },
+			apply: func(t *config.Target, s string) error {
+				n, err := strconv.Atoi(strings.TrimSpace(s))
+				if err != nil {
+					return fmt.Errorf("%q 不是整数", s)
+				}
+				if n < 0 {
+					return fmt.Errorf("权重不能为负")
+				}
+				t.Weight = n
+				return nil
+			},
+		},
+		{
+			label: "探测方式 (ping/tcp/udp/http)",
+			get:   func(t *config.Target) string { return string(t.Probe) },
+			apply: func(t *config.Target, s string) error {
+				m := config.ProbeMethod(strings.ToLower(strings.TrimSpace(s)))
+				switch m {
+				case config.ProbePing, config.ProbeTCP, config.ProbeUDP, config.ProbeHTTP:
+					t.Probe = m
+					switch m {
+					case config.ProbePing:
+						t.Port, t.URL = 0, ""
+					case config.ProbeTCP, config.ProbeUDP:
+						t.URL = ""
+					case config.ProbeHTTP:
+						t.Port = 0
+					}
+					return nil
+				default:
+					return fmt.Errorf("未知探测方式 %q（支持 ping/tcp/udp/http）", s)
+				}
+			},
+		},
 	}
-	e.taskIdx = 0
-	e.nextTask()
+	if e.formTarget.Probe == config.ProbeTCP || e.formTarget.Probe == config.ProbeUDP {
+		fields = append(fields, targetFormField{
+			label: "端口 (1-65535)",
+			get: func(t *config.Target) string {
+				if t.Port == 0 {
+					return ""
+				}
+				return strconv.Itoa(t.Port)
+			},
+			apply: func(t *config.Target, s string) error {
+				n, err := strconv.Atoi(strings.TrimSpace(s))
+				if err != nil || n < 1 || n > 65535 {
+					return fmt.Errorf("端口必须为 1-65535")
+				}
+				t.Port = n
+				return nil
+			},
+		})
+	}
+	if e.formTarget.Probe == config.ProbeHTTP {
+		fields = append(fields, targetFormField{
+			label: "完整 URL（如 http://1.2.3.4/healthz）",
+			get:   func(t *config.Target) string { return t.URL },
+			apply: func(t *config.Target, s string) error {
+				s = strings.TrimSpace(s)
+				if !strings.HasPrefix(s, "http://") && !strings.HasPrefix(s, "https://") {
+					return fmt.Errorf("%q 必须以 http:// 或 https:// 开头", s)
+				}
+				t.URL = s
+				return nil
+			},
+		})
+	}
+	return fields
+}
+
+func (e *cfgEditor) editTarget(idx int) {
+	if idx < 0 || idx >= len(e.cfg.Targets) {
+		return
+	}
+	e.formTarget = e.cfg.Targets[idx]
+	e.formTargetIdx = idx
+	e.formOrigName = e.formTarget.Name
+	e.formIdx = 0
+	e.formActive = true
+	e.mode = modeForm
+	e.msg = ""
 }
 
 func (e *cfgEditor) addTarget() {
-	var t config.Target
-	e.taskQueue = targetTasks(&t, false)
-	// 名字查重
-	e.taskQueue[0].apply = func(s string) error {
-		s = strings.TrimSpace(s)
-		if s == "" {
-			return fmt.Errorf("名字不能为空")
-		}
-		for _, x := range e.cfg.Targets {
-			if x.Name == s {
-				return fmt.Errorf("名字 %q 已存在", s)
-			}
-		}
-		t.Name = s
-		return nil
+	e.formTarget = config.Target{Weight: 100, Probe: config.ProbePing}
+	e.formTargetIdx = -1
+	e.formOrigName = ""
+	e.formIdx = 0
+	e.formActive = true
+	e.mode = modeForm
+	e.msg = ""
+}
+
+func (e *cfgEditor) commitTargetForm() {
+	if !e.formActive {
+		return
 	}
-	// 队列末尾追加"完成"动作：把新 target 加入列表
-	done := e.taskQueue
-	e.taskQueue = append(done, inputTask{label: "确认新增 (y/N)", cur: "n", apply: func(s string) error {
-		if !strings.EqualFold(strings.TrimSpace(s), "y") {
-			return fmt.Errorf("已取消")
+	if e.formTarget.Name == "" {
+		e.msg = "保存失败: 名字不能为空"
+		return
+	}
+	for i, t := range e.cfg.Targets {
+		if i != e.formTargetIdx && t.Name == e.formTarget.Name {
+			e.msg = "保存失败: 名字 " + fmt.Sprintf("%q", t.Name) + " 已存在"
+			return
 		}
-		e.cfg.Targets = append(e.cfg.Targets, t)
+	}
+	trial := *e.cfg
+	trial.Targets = append([]config.Target(nil), e.cfg.Targets...)
+	if e.formTargetIdx < 0 {
+		trial.Targets = append(trial.Targets, e.formTarget)
+	} else {
+		trial.Targets[e.formTargetIdx] = e.formTarget
+	}
+	if err := trial.Validate(); err != nil {
+		e.msg = "保存失败: " + err.Error()
+		return
+	}
+	if e.formTargetIdx < 0 {
+		e.cfg.Targets = append(e.cfg.Targets, e.formTarget)
 		e.sel = len(globalFields) + len(e.cfg.Targets) - 1
-		e.msg = "已新增上游 " + t.Name + "（按 s 保存生效）"
-		return nil
-	}})
-	e.taskIdx = 0
-	e.nextTask()
+		e.msg = "已新增上游 " + e.formTarget.Name + "（按 s 保存生效）"
+	} else {
+		e.cfg.Targets[e.formTargetIdx] = e.formTarget
+		e.sel = len(globalFields) + e.formTargetIdx
+		e.msg = "已修改上游 " + e.formTarget.Name + "（按 s 保存生效）"
+	}
+	e.formActive = false
+	e.mode = modeNav
+}
+
+func (e *cfgEditor) cancelTargetForm() {
+	e.formActive = false
+	e.mode = modeNav
+	e.msg = "已取消"
 }
 
 func (e *cfgEditor) deleteTarget() {
@@ -546,6 +738,7 @@ func (e *cfgEditor) deleteTarget() {
 	e.inputCur = "n"
 	e.inputBuf = nil
 	e.inputApply = func(s string) error { return nil }
+	e.inputReturn = modeNav
 }
 
 // ---------- 保存 ----------
@@ -572,6 +765,12 @@ func (e *cfgEditor) save() {
 func (e *cfgEditor) render() {
 	var sb strings.Builder
 	sb.WriteString("\x1b[H")
+	if e.mode == modeForm || (e.mode == modeInput && e.inputReturn == modeForm) {
+		e.renderTargetForm(&sb)
+		sb.WriteString("\x1b[K\x1b[J")
+		fmt.Print(sb.String())
+		return
+	}
 	sb.WriteString("nexthop 配置编辑器  ↑/↓ 选择  回车 编辑  a 新增  d 删除  s 保存  q/ESC 退出")
 	sb.WriteString("\x1b[K\r\n")
 	sb.WriteString("── 全局配置 ──────────────────────────────\x1b[K\r\n")
@@ -602,6 +801,29 @@ func (e *cfgEditor) render() {
 	}
 	sb.WriteString("\x1b[K\x1b[J")
 	fmt.Print(sb.String())
+}
+
+func (e *cfgEditor) renderTargetForm(sb *strings.Builder) {
+	title := "编辑上游"
+	if e.formTargetIdx < 0 {
+		title = "新增上游"
+	}
+	sb.WriteString("nexthop 配置编辑器  " + title + "  ↑/↓ 选择  回车 编辑  s 确认  q/ESC 取消")
+	sb.WriteString("\x1b[K\r\n")
+	sb.WriteString("── 上游实例 ──────────────────────────────\x1b[K\r\n")
+	for i, f := range targetFormFields(e) {
+		line := fmt.Sprintf("  %-38s %s", f.label, f.get(&e.formTarget))
+		if e.mode == modeForm && i == e.formIdx {
+			line = "\x1b[7m" + line + "\x1b[0m"
+		}
+		sb.WriteString(line)
+		sb.WriteString("\x1b[K\r\n")
+	}
+	if e.mode == modeInput {
+		sb.WriteString("\x1b[K\r\n" + e.inputPrompt + string(e.inputBuf))
+	} else {
+		sb.WriteString("\x1b[K\r\n" + e.msg)
+	}
 }
 
 func (e *cfgEditor) renderLine(line int, content string) string {
