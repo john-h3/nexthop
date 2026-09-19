@@ -103,11 +103,12 @@ func newTestManager(t *testing.T, cfg *config.Config, results map[string][]probe
 	t.Helper()
 	updater := &fakeUpdater{}
 	m := &Manager{
-		cfg:     cfg,
-		probers: make(map[string]probe.Prober, len(cfg.Targets)),
-		states:  make(map[string]*TargetState, len(cfg.Targets)),
-		updater: updater,
-		log:     quietLog(),
+		cfg:          cfg,
+		probers:      make(map[string]probe.Prober, len(cfg.Targets)),
+		states:       make(map[string]*TargetState, len(cfg.Targets)),
+		updater:      updater,
+		log:          quietLog(),
+		nextInterval: cfg.ProbeInterval,
 	}
 	for i := range cfg.Targets {
 		tgt := &cfg.Targets[i]
@@ -400,5 +401,85 @@ func TestRouteSelfHeal(t *testing.T) {
 	m.ProbeOnce(context.Background())
 	if updater.count() != before {
 		t.Fatalf("路由一致时不应重复设置，实际调用 %d -> %d 次", before, updater.count())
+	}
+}
+
+// 测试自适应探测间隔：检测到问题时减半，恢复正常后重置
+func TestAdaptiveProbeInterval(t *testing.T) {
+	cfg := &config.Config{
+		ProbeInterval: 5 * time.Second,
+		ProbeTimeout:  100 * time.Millisecond,
+		EgressDevice:  "eth0",
+		StableRounds:  3,
+		FinalIP:       "10.0.0.254",
+		Targets: []config.Target{
+			{Name: "a", IP: "10.0.0.1", Weight: 100, Probe: config.ProbePing},
+		},
+	}
+
+	// 场景：a 先 up 稳定，然后连续 down 触发防抖
+	// 预期间隔变化：5s -> 5s(第1次down) -> 2.5s(第2次down) -> 1.25s(第3次down确认切换)
+	resA := append(
+		append([]probe.Result{}, up(), up(), up()), // 前3轮稳定up
+		down(), down(), down(), // 3轮down触发防抖
+		up(), up(), up(), // 恢复up
+	)
+	m, _ := newTestManager(t, cfg, map[string][]probe.Result{
+		"a": resA,
+	})
+
+	// 初始间隔应为基础间隔
+	if got := m.interval(); got != 5*time.Second {
+		t.Fatalf("初始间隔 = %v, want 5s", got)
+	}
+
+	// 前3轮 up 稳定后，间隔仍为基础间隔
+	for i := 0; i < 3; i++ {
+		m.ProbeOnce(context.Background())
+	}
+	if got := m.interval(); got != 5*time.Second {
+		t.Fatalf("稳定后间隔 = %v, want 5s", got)
+	}
+
+	// 第4轮：a 第1次 down，进入防抖，间隔应减半到 2.5s
+	m.ProbeOnce(context.Background())
+	if got := m.interval(); got != 2500*time.Millisecond {
+		t.Fatalf("第1次down后间隔 = %v, want 2.5s", got)
+	}
+
+	// 第5轮：a 第2次 down，仍在防抖，间隔应减半到 1.25s
+	m.ProbeOnce(context.Background())
+	if got := m.interval(); got != 1250*time.Millisecond {
+		t.Fatalf("第2次down后间隔 = %v, want 1.25s", got)
+	}
+
+	// 第6轮：a 第3次 down，确认翻转，间隔应重置为 5s
+	m.ProbeOnce(context.Background())
+	if got := m.interval(); got != 5*time.Second {
+		t.Fatalf("确认翻转后间隔 = %v, want 5s", got)
+	}
+
+	// 验证状态已翻转为 down
+	if st, ok := m.states["a"]; !ok || st.Up {
+		t.Fatal("a 应已翻转为 down")
+	}
+
+	// 恢复 up：前2轮不切，第3轮确认切回
+	m.ProbeOnce(context.Background())
+	if got := m.interval(); got != 2500*time.Millisecond {
+		t.Fatalf("恢复第1轮间隔 = %v, want 2.5s", got)
+	}
+	m.ProbeOnce(context.Background())
+	if got := m.interval(); got != 1250*time.Millisecond {
+		t.Fatalf("恢复第2轮间隔 = %v, want 1.25s", got)
+	}
+	m.ProbeOnce(context.Background())
+	if got := m.interval(); got != 5*time.Second {
+		t.Fatalf("恢复确认后间隔 = %v, want 5s", got)
+	}
+
+	// 验证状态已恢复为 up
+	if st, ok := m.states["a"]; !ok || !st.Up {
+		t.Fatal("a 应已恢复为 up")
 	}
 }

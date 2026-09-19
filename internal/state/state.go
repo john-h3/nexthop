@@ -47,6 +47,9 @@ type Manager struct {
 
 	currentNexthop string // 当前已生效的路由网关
 	finalActive    bool
+
+	// 自适应探测间隔：检测到问题时减半，恢复正常后重置
+	nextInterval time.Duration
 }
 
 // New 构造 Manager，并立即构建探测器和状态表。
@@ -55,11 +58,12 @@ func New(cfg *config.Config, updater RouteUpdater, log *slog.Logger) (*Manager, 
 		log = slog.Default()
 	}
 	m := &Manager{
-		cfg:     cfg,
-		probers: make(map[string]probe.Prober, len(cfg.Targets)),
-		states:  make(map[string]*TargetState, len(cfg.Targets)),
-		updater: updater,
-		log:     log,
+		cfg:          cfg,
+		probers:      make(map[string]probe.Prober, len(cfg.Targets)),
+		states:       make(map[string]*TargetState, len(cfg.Targets)),
+		updater:      updater,
+		log:          log,
+		nextInterval: cfg.ProbeInterval,
 	}
 	for i := range cfg.Targets {
 		t := &cfg.Targets[i]
@@ -91,7 +95,7 @@ func (m *Manager) Run(ctx context.Context) {
 func (m *Manager) interval() time.Duration {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.cfg.ProbeInterval
+	return m.nextInterval
 }
 
 // ProbeOnce 执行一轮探测、更新状态并视需要切换路由。
@@ -131,6 +135,7 @@ func (m *Manager) ProbeOnce(ctx context.Context) {
 func (m *Manager) applyResults(targets []config.Target, results []probe.Result) {
 	now := time.Now()
 	changed := false
+	hasPending := false // 是否有目标处于防抖中间状态
 
 	for i, t := range targets {
 		st, ok := m.states[t.Name]
@@ -155,6 +160,7 @@ func (m *Manager) applyResults(targets []config.Target, results []probe.Result) 
 			} else {
 				st.pending++
 			}
+			hasPending = true
 			if st.pending >= m.cfg.StableRounds {
 				st.Up = res.OK
 				st.pending = 0
@@ -166,6 +172,20 @@ func (m *Manager) applyResults(targets []config.Target, results []probe.Result) 
 		} else {
 			st.pending = 0
 		}
+	}
+
+	// 自适应探测间隔：有防抖中间状态时减半，否则重置为基础间隔
+	if hasPending && !changed {
+		// 还在防抖中，且本轮未确认翻转 → 下轮加速探测（当前间隔减半）
+		half := m.nextInterval / 2
+		if half < 100*time.Millisecond {
+			half = 100 * time.Millisecond // 最小间隔 100ms
+		}
+		m.nextInterval = half
+		m.log.Debug("探测间隔减半", "interval", m.nextInterval)
+	} else {
+		// 正常状态 或 刚确认翻转 → 恢复基础间隔
+		m.nextInterval = m.cfg.ProbeInterval
 	}
 
 	// 状态变化，或实际路由与期望不一致（含外部手动修改/删除）时收敛路由。
@@ -245,6 +265,7 @@ func (m *Manager) Reload(cfg *config.Config) error {
 	m.cfg = cfg
 	m.probers = newProbers
 	m.states = newStates
+	m.nextInterval = cfg.ProbeInterval // 热加载后重置间隔
 	m.log.Info("配置已热加载", "targets", len(cfg.Targets))
 	// 目标集合变化后，若实际路由与期望不一致则立即收敛。
 	if !m.routeMatchesDesiredLocked() {

@@ -11,6 +11,7 @@ nexthop 是一个运行在网关机器上的 Go 守护进程：周期探测多�
 - 探测间隔可配置，支持 `1ms` / `1s` / `1m` 等 Go duration 写法
 - 权重决策：存活目标按权重降序选择，同权重保持配置顺序
 - 防抖：目标状态需连续 `stable_rounds` 轮探测保持才翻转，避免路由 flapping
+- 自适应探测间隔：检测到异常时自动加速探测（间隔减半），快速完成故障切换；恢复正常后重置为基础间隔
 - 兜底：全部上游失效时，路由切到 `final_ip`
 - 热加载：`SIGHUP` 或 `nexthop reload`
 - 本地管理通道：Unix domain socket + HTTP（`/run/nexthop.sock`），不暴露网络端口
@@ -76,10 +77,10 @@ docker run -d --name nexthop \
 部署到 `/etc/nexthop/config.yaml`：
 
 ```yaml
-probe_interval: 5s
-probe_timeout: 1s
+probe_interval: 5s       # 基础探测间隔
+probe_timeout: 1s        # 单次探测超时
 egress_device: eth0      # 出口网卡，default route 绑定的 dev
-stable_rounds: 2
+stable_rounds: 3         # 防抖轮数（自适应间隔下切换时间 ≈ interval + interval/2 + interval/4）
 final_ip: 10.0.0.254     # 全部上游失效时的兜底
 
 targets:
@@ -93,6 +94,17 @@ targets:
     probe: tcp
     port: 443
 ```
+
+### 自适应探测间隔
+
+当检测到上游异常时，探测间隔会自动减半以加速故障确认：
+
+```
+正常: 5s → 故障轮1: 2.5s → 故障轮2: 1.25s → 故障轮3: 确认切换
+总切换时间: 5 + 2.5 + 1.25 = 8.75s
+```
+
+恢复时同样采用自适应间隔，确保快速切回。
 
 ## 测试
 
